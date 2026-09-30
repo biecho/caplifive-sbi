@@ -2010,7 +2010,9 @@ static unsigned managed_reset_region(unsigned id, unsigned prepare) {
  * as the scratch register. Only the outputs are written last, so an output
  * that happens to share a register with a fixed operand is still correct. A
  * linear source is consumed by stc on the RTL, so nothing reads a register
- * after it was stored. */
+ * after it was stored. Scalars park at -8..-32 and capabilities, 16 bytes
+ * each, at -48 and below: a capability at -16 would cover the scalar at -8
+ * (the first gate run read the handle's low word as the page address). */
 
 /* CREATE: id, lo, hi, prot in a0-a3, delivery register number in a4, root
  * page in rs1 (consumed), domain in rs2 (unchanged, its context receives the
@@ -2049,12 +2051,12 @@ static __rev void *map_create_insn(unsigned id, unsigned lo, unsigned hi, unsign
 static __rev void *map_populate_insn(unsigned v, __rev void *handle, __linear void *frame) {
     __rev void *out;
     __asm__("sd %1, -8(sp);"
-            "stc(%2, sp, -16);"
-            "stc(%3, sp, -32);"
+            "stc(%2, sp, -32);"
+            "stc(%3, sp, -48);"
             "ld a0, -8(sp);"
             "li a5, 0;"
-            "ldc(a6, sp, -16);"
-            "ldc(a7, sp, -32);"
+            "ldc(a6, sp, -32);"
+            "ldc(a7, sp, -48);"
             ".insn r 0x5b, 0x1, 0x0f, x0, a6, a7;"
             "movc(%0, a6)"
             : "=r"(out)
@@ -2068,14 +2070,14 @@ static __rev void *map_populate_table_insn(unsigned v, __linear void *table, __r
                                            __linear void *frame) {
     __rev void *out;
     __asm__("sd %1, -8(sp);"
-            "stc(%2, sp, -16);"
-            "stc(%3, sp, -32);"
-            "stc(%4, sp, -48);"
+            "stc(%2, sp, -32);"
+            "stc(%3, sp, -48);"
+            "stc(%4, sp, -64);"
             "ld a0, -8(sp);"
-            "ldc(tp, sp, -16);"
+            "ldc(tp, sp, -32);"
             "li a5, 4;"
-            "ldc(a6, sp, -32);"
-            "ldc(a7, sp, -48);"
+            "ldc(a6, sp, -48);"
+            "ldc(a7, sp, -64);"
             ".insn r 0x5b, 0x1, 0x0f, x0, a6, a7;"
             "movc(%0, a6)"
             : "=r"(out)
@@ -2127,7 +2129,9 @@ static unsigned map_reserve(unsigned len, unsigned *hi_out) {
 /* GRANT: split the managed region's chunk into a root page, leaf table pages
  * and frames, create the mapping for the domain and populate every page. The
  * mapping capability goes into the domain's sealed context, never through a
- * monitor register (encoding decision E8). Returns the binding word or -1. */
+ * monitor register (encoding decision E8). The chunk's MREV root covers every
+ * piece, including an unused tail, so RELEASE reclaims all of it. Returns the
+ * binding word or -1. */
 static unsigned map_grant(unsigned dom, unsigned region, unsigned len, unsigned prot) {
     __linear void *rest;
     __linear void *page;
@@ -2156,7 +2160,10 @@ static unsigned map_grant(unsigned dom, unsigned region, unsigned len, unsigned 
     base = cap_base(rest);
     if (cap_end(rest) - base < need) { regions[region] = rest; return -1; }
     left = (cap_end(rest) - base) >> 12;
-    regions[region] = 0;
+    /* Linux gives the whole chunk up: the CPMP association goes (as for a
+     * TRANSFERRED share), the slot is not live until RELEASE has reset it, and
+     * a leftover tail is left to the reclaim from above. */
+    managed_unmap(region);
     lo = map_reserve(len, &hi);
     /* The root page: the first page of the chunk. */
     page = rest;
@@ -2183,22 +2190,27 @@ static unsigned map_grant(unsigned dom, unsigned region, unsigned len, unsigned 
             handle = map_populate_insn(lo + (i << 12), handle, page);
         }
     }
-    /* A leftover tail of the chunk stays in the region table; the chunk's
-     * MREV root covers every piece, so reclamation returns all of it. */
-    if (left > 0) { regions[region] = rest; }
     binding = __capfield(handle, 8);
-    mapping_handle[m] = handle;
-    mapping_dom[m] = dom;
-    mapping_region[m] = region;
-    mapping_lo[m] = lo;
-    mapping_hi[m] = hi;
-    mapping_binding[m] = binding;
-    mapping_live[m] = 1;
+    /* One indexed store per basic block: capstone-c keeps every temporary of
+     * a block live until the block ends, and once the registers run out its
+     * spill path handed the offset and the table capability the same
+     * register (cincoffset t1, t1, t1; observed in the first gate run). Each
+     * `if` starts a fresh block with an empty register file. */
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_handle[m] = handle; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_dom[m] = dom; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_region[m] = region; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_lo[m] = lo; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_hi[m] = hi; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_binding[m] = binding; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_live[m] = 1; }
     return binding;
 }
 
 /* RELEASE: detach, destroy, then reclaim the chunk through the managed
- * region path (revoke from above, scrub, re-arm for the process cache). */
+ * region path (revoke from above, scrub, re-MREV). The region comes back in
+ * the prepared state, a linear chunk as after REGION_CREATE, so the driver
+ * can grant or share it again; the node budget is checked before the mapping
+ * is touched, so a refusal leaves it intact. */
 static unsigned map_release(unsigned dom, unsigned binding) {
     __rev void *tok;
     unsigned m, region;
@@ -2206,12 +2218,13 @@ static unsigned map_release(unsigned dom, unsigned binding) {
         if (mapping_live[m] != 0 && mapping_dom[m] == dom && mapping_binding[m] == binding) { break; }
     }
     if (m >= CAPSTONE_MAX_MAPPING_N) { return -1; }
+    if (managed_can_allocate() == 0) { return -1; }
     tok = map_detach_insn(mapping_handle[m]);
     map_destroy_insn(tok);
     region = mapping_region[m];
-    mapping_live[m] = 0;
-    mapping_binding[m] = 0;
-    return managed_reset_region(region, 0);
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_live[m] = 0; }
+    if (m < CAPSTONE_MAX_MAPPING_N) { mapping_binding[m] = 0; }
+    return managed_reset_region(region, 1);
 }
 
 #endif
