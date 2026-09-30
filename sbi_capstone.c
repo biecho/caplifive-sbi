@@ -688,6 +688,22 @@ unsigned managed_domain_region[CAPSTONE_MAX_DOM_N];
 unsigned managed_domain_live[CAPSTONE_MAX_DOM_N];
 __rev void *managed_region_root[CAPSTONE_MAX_REGION_N];
 unsigned managed_region_owned[CAPSTONE_MAX_REGION_N];
+/* Translated mappings (M2, superproject docs/plans/mapping-transport-m2.md).
+ * One entry per live mapping: the detach handle (the only authority the
+ * monitor holds over the mapping, and it carries no data access), the owning
+ * domain, the managed region whose chunk backs it, the logical range and the
+ * binding word. The chunk's MREV root in managed_region_root[] is the
+ * revocation-from-above handle for the whole mapping. */
+#define CAPSTONE_MAX_MAPPING_N 32
+#define CAPSTONE_MAP_DELIVERY_REG 12
+__rev void *mapping_handle[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_dom[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_region[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_lo[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_hi[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_binding[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_live[CAPSTONE_MAX_MAPPING_N];
+unsigned mapping_next_base;
 
 static void managed_unmap(unsigned id) {
     void *discard;
@@ -1982,6 +1998,222 @@ static unsigned managed_reset_region(unsigned id, unsigned prepare) {
     return 0;
 }
 
+/* Mapping instruction wrappers. The instructions read their scalar operands
+ * from fixed registers (a0-a4, a5 for the table-page register number), which
+ * capstone-c's inline assembly cannot pin: it allocates every operand
+ * register itself and has no clobber list. Each wrapper is therefore a
+ * function of its own, so that on entry a0-a7 hold nothing live (the caller
+ * spills all caller-saved registers around a call and the prologue spills the
+ * parameters), and its template first parks every operand in the red zone
+ * below sp, which the compiler itself uses around domain calls, before it
+ * loads the fixed registers. tp is never allocated by the compiler and serves
+ * as the scratch register. Only the outputs are written last, so an output
+ * that happens to share a register with a fixed operand is still correct. A
+ * linear source is consumed by stc on the RTL, so nothing reads a register
+ * after it was stored. */
+
+/* CREATE: id, lo, hi, prot in a0-a3, delivery register number in a4, root
+ * page in rs1 (consumed), domain in rs2 (unchanged, its context receives the
+ * mapping capability). Returns the detach handle; the domain goes back into
+ * its table slot. */
+static __rev void *map_create_insn(unsigned id, unsigned lo, unsigned hi, unsigned prot_reg,
+                                   __linear void *root, unsigned dom_idx) {
+    __rev void *handle;
+    __dom void *d;
+    d = domains[dom_idx];
+    __asm__("sd %2, -8(sp);"
+            "sd %3, -16(sp);"
+            "sd %4, -24(sp);"
+            "sd %5, -32(sp);"
+            "stc(%6, sp, -48);"
+            "stc(%7, sp, -64);"
+            "ld a0, -8(sp);"
+            "ld a1, -16(sp);"
+            "ld a2, -24(sp);"
+            "ld a3, -32(sp);"
+            "srli a4, a3, 8;"
+            "andi a3, a3, 0xff;"
+            "ldc(a5, sp, -48);"
+            "ldc(a6, sp, -64);"
+            ".insn r 0x5b, 0x1, 0x0e, tp, a5, a6;"
+            "movc(%1, a6);"
+            "movc(%0, tp)"
+            : "=r"(handle), "=r"(d)
+            : "r"(id), "r"(lo), "r"(hi), "r"(prot_reg), "r"(root), "r"(d));
+    domains[dom_idx] = d;
+    return handle;
+}
+
+/* POPULATE of a page whose leaf table exists: v in a0, no table page (a5 = 0),
+ * handle in rs1 (stays), frame in rs2 (consumed). */
+static __rev void *map_populate_insn(unsigned v, __rev void *handle, __linear void *frame) {
+    __rev void *out;
+    __asm__("sd %1, -8(sp);"
+            "stc(%2, sp, -16);"
+            "stc(%3, sp, -32);"
+            "ld a0, -8(sp);"
+            "li a5, 0;"
+            "ldc(a6, sp, -16);"
+            "ldc(a7, sp, -32);"
+            ".insn r 0x5b, 0x1, 0x0f, x0, a6, a7;"
+            "movc(%0, a6)"
+            : "=r"(out)
+            : "r"(v), "r"(handle), "r"(frame));
+    return out;
+}
+
+/* POPULATE of the first page under a new leaf table: the table page travels in
+ * tp and a5 names that register (4). */
+static __rev void *map_populate_table_insn(unsigned v, __linear void *table, __rev void *handle,
+                                           __linear void *frame) {
+    __rev void *out;
+    __asm__("sd %1, -8(sp);"
+            "stc(%2, sp, -16);"
+            "stc(%3, sp, -32);"
+            "stc(%4, sp, -48);"
+            "ld a0, -8(sp);"
+            "ldc(tp, sp, -16);"
+            "li a5, 4;"
+            "ldc(a6, sp, -32);"
+            "ldc(a7, sp, -48);"
+            ".insn r 0x5b, 0x1, 0x0f, x0, a6, a7;"
+            "movc(%0, a6)"
+            : "=r"(out)
+            : "r"(v), "r"(table), "r"(handle), "r"(frame));
+    return out;
+}
+
+/* DETACH: the handle becomes the destroy token. */
+static __rev void *map_detach_insn(__rev void *handle) {
+    __rev void *tok;
+    __asm__(".insn r 0x5b, 0x1, 0x10, %0, %1, x0" : "=r"(tok) : "r"(handle));
+    return tok;
+}
+
+/* DESTROY: consumes the token. */
+static void map_destroy_insn(__rev void *tok) {
+    __asm__(".insn r 0x5b, 0x1, 0x12, x0, %0, x0" : : "r"(tok));
+}
+
+/* capstone-c evaluates shifts at 32 bits, so a wide shift is done in steps. */
+static unsigned map_shl(unsigned x, unsigned n) {
+    while (n > 16) {
+        x = x << 16;
+        n = n - 16;
+    }
+    return x << n;
+}
+
+/* The E6 allocation rule: a reservation is a power of two no smaller than the
+ * request, at a base that is a multiple of twice its size, taken from a bump
+ * allocator over the logical region [2^57, 2^63). Ranges are never reused
+ * within a boot: the region is vast and the registry keeps them apart anyway. */
+static unsigned map_reserve(unsigned len, unsigned *hi_out) {
+    unsigned size, align, lo;
+    if (mapping_next_base == 0) {
+        mapping_next_base = map_shl(1, 57);
+    }
+    size = 4096;
+    while (size < len) {
+        size = size << 1;
+    }
+    align = size << 1;
+    lo = (mapping_next_base + align - 1) & ~(align - 1);
+    mapping_next_base = lo + size;
+    *hi_out = lo + size;
+    return lo;
+}
+
+/* GRANT: split the managed region's chunk into a root page, leaf table pages
+ * and frames, create the mapping for the domain and populate every page. The
+ * mapping capability goes into the domain's sealed context, never through a
+ * monitor register (encoding decision E8). Returns the binding word or -1. */
+static unsigned map_grant(unsigned dom, unsigned region, unsigned len, unsigned prot) {
+    __linear void *rest;
+    __linear void *page;
+    __linear void *table;
+    __rev void *handle;
+    unsigned pages, leaves, need, m, i, lo, hi, base, cut, binding, left;
+    if (dom >= dom_n) { return -1; }
+    if (managed_domain_live[dom] == 0) { return -1; }
+    if (region >= region_n) { return -1; }
+    if (managed_region_owned[region] == 0) { return -1; }
+    if (region_live[region] == 0) { return -1; }
+    if (len == 0) { return -1; }
+    if ((len & 4095) != 0) { return -1; }
+    if (len > map_shl(1, 28)) { return -1; }
+    if (prot != 4 && prot != 6) { return -1; }
+    for (m = 0; m < CAPSTONE_MAX_MAPPING_N; m += 1) {
+        if (mapping_live[m] == 0) { break; }
+    }
+    if (m >= CAPSTONE_MAX_MAPPING_N) { return -1; }
+    if (managed_can_allocate() == 0) { return -1; }
+    rest = regions[region];
+    if (cap_type(rest) != 0) { regions[region] = rest; return -1; }
+    pages = len >> 12;
+    leaves = (pages + 255) >> 8;
+    need = (1 + leaves + pages) << 12;
+    base = cap_base(rest);
+    if (cap_end(rest) - base < need) { regions[region] = rest; return -1; }
+    left = (cap_end(rest) - base) >> 12;
+    regions[region] = 0;
+    lo = map_reserve(len, &hi);
+    /* The root page: the first page of the chunk. */
+    page = rest;
+    rest = __split(page, base + 4096);
+    left = left - 1;
+    handle = map_create_insn(m, lo, hi, prot | (CAPSTONE_MAP_DELIVERY_REG << 8), page, dom);
+    cut = base + 4096;
+    for (i = 0; i < pages; i += 1) {
+        if ((i & 255) == 0) {
+            table = rest;
+            if (left > 1) { rest = __split(table, cut + 4096); }
+            cut = cut + 4096;
+            left = left - 1;
+            page = rest;
+            if (left > 1) { rest = __split(page, cut + 4096); }
+            cut = cut + 4096;
+            left = left - 1;
+            handle = map_populate_table_insn(lo + (i << 12), table, handle, page);
+        } else {
+            page = rest;
+            if (left > 1) { rest = __split(page, cut + 4096); }
+            cut = cut + 4096;
+            left = left - 1;
+            handle = map_populate_insn(lo + (i << 12), handle, page);
+        }
+    }
+    /* A leftover tail of the chunk stays in the region table; the chunk's
+     * MREV root covers every piece, so reclamation returns all of it. */
+    if (left > 0) { regions[region] = rest; }
+    binding = __capfield(handle, 8);
+    mapping_handle[m] = handle;
+    mapping_dom[m] = dom;
+    mapping_region[m] = region;
+    mapping_lo[m] = lo;
+    mapping_hi[m] = hi;
+    mapping_binding[m] = binding;
+    mapping_live[m] = 1;
+    return binding;
+}
+
+/* RELEASE: detach, destroy, then reclaim the chunk through the managed
+ * region path (revoke from above, scrub, re-arm for the process cache). */
+static unsigned map_release(unsigned dom, unsigned binding) {
+    __rev void *tok;
+    unsigned m, region;
+    for (m = 0; m < CAPSTONE_MAX_MAPPING_N; m += 1) {
+        if (mapping_live[m] != 0 && mapping_dom[m] == dom && mapping_binding[m] == binding) { break; }
+    }
+    if (m >= CAPSTONE_MAX_MAPPING_N) { return -1; }
+    tok = map_detach_insn(mapping_handle[m]);
+    map_destroy_insn(tok);
+    region = mapping_region[m];
+    mapping_live[m] = 0;
+    mapping_binding[m] = 0;
+    return managed_reset_region(region, 0);
+}
+
 #endif
 
 // SBI implementation
@@ -2054,6 +2286,12 @@ unsigned handle_trap_ecall(unsigned arg0, unsigned arg1,
                     break;
                 case SBI_CAPSTONE_PROCESS_RESUME_SHARE:
                     res = supervised_invoke(arg0, 0, 0);
+                    break;
+                case SBI_CAPSTONE_MAP_GRANT:
+                    res = map_grant(arg0, arg1, arg2, arg3);
+                    break;
+                case SBI_CAPSTONE_MAP_RELEASE:
+                    res = map_release(arg0, arg1);
                     break;
                 case SBI_CAPSTONE_PROCESS_STATS:
                     __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0"
