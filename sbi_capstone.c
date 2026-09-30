@@ -704,6 +704,15 @@ unsigned mapping_hi[CAPSTONE_MAX_MAPPING_N];
 unsigned mapping_binding[CAPSTONE_MAX_MAPPING_N];
 unsigned mapping_live[CAPSTONE_MAX_MAPPING_N];
 unsigned mapping_next_base;
+/* A CREATE wrote a mapping capability into this domain's context and the
+ * domain has not been entered since: the slot is still occupied, and a
+ * second CREATE would fault in the monitor. Cleared by supervised_invoke. */
+unsigned mapping_delivery_pending[CAPSTONE_MAX_DOM_N];
+/* The domain's last step ended with a return at a round (STEP kind 0): its
+ * next entry resumes .Lyield_resume, where a2 is free for a delivery. After a
+ * preemption or a fault, or before the first step, the context holds an
+ * interrupted computation, whose saved state overlaps the delivery slot. */
+unsigned mapping_domain_at_round[CAPSTONE_MAX_DOM_N];
 
 static void managed_unmap(unsigned id) {
     void *discard;
@@ -745,12 +754,27 @@ unsigned supervised_results[CAPSTONE_MAX_DOM_N];
 /* Leave the VM's emergency reserve available for destruction of all 32 owners.
  * Application MREV/SPLIT also stop at this reserve. Creation fails before any
  * authority is carved, so the Linux allocator can roll back a fresh block. */
-static unsigned managed_can_allocate(void) {
+static unsigned managed_nodes_available(void) {
     unsigned available, selector;
     selector = 7;
     __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, %1, x0"
         : "=r"(available) : "r"(selector));
-    return available >= 288;
+    return available;
+}
+
+static unsigned managed_can_allocate(void) {
+    return managed_nodes_available() >= 288;
+}
+
+/* Admission for an operation that allocates `need` revocation nodes: the
+ * operation may not start unless all of them are free on top of the reserve
+ * the rest of the monitor relies on (288). One collection first when they are
+ * not, since dead nodes only return to the free list through the collector. */
+static unsigned managed_can_allocate_n(unsigned need) {
+    unsigned collected;
+    if (managed_nodes_available() >= 288 + need) { return 1; }
+    __asm__ volatile (".insn r 0x5b, 0x1, 0x23, %0, x0, x0" : "=r"(collected));
+    return managed_nodes_available() >= 288 + need;
 }
 
 static unsigned supervised_invoke(unsigned id, unsigned request, void *argument) {
@@ -774,6 +798,8 @@ static unsigned supervised_invoke(unsigned id, unsigned request, void *argument)
      * flush in QEMU, plus 9 S/M CSR swaps) would only repeat that. */
     d = __domcall(d, request, argument);
     domains[id] = d;
+    /* The call delivered any mapping capability waiting in the context. */
+    if (id < CAPSTONE_MAX_DOM_N) { mapping_delivery_pending[id] = 0; }
     return supervised_events[0];
 }
 
@@ -786,6 +812,7 @@ static unsigned supervised_call(unsigned id) {
     result = __tighten(result, 2);
     kind = supervised_invoke(id, CAPSTONE_DPI_CALL, result);
     if (kind == (unsigned)-1) { return -1; }
+    if (id < CAPSTONE_MAX_DOM_N) { mapping_domain_at_round[id] = kind == 0; }
     /* The whole event goes back in this one ecall. The kind is the SBI value
      * (a1); result, cause, pc and address travel in a2..a5, written into the
      * S-mode trap frame that return_to_sumode restores. STEP is the only
@@ -1127,6 +1154,8 @@ static unsigned create_domain(unsigned base_addr, unsigned code_size,
         managed_domain_size[domain_slot] = tot_size;
         managed_domain_region[domain_slot] = cache_region;
         managed_domain_live[domain_slot] = 1;
+        mapping_delivery_pending[domain_slot] = 0;
+        mapping_domain_at_round[domain_slot] = 0;
     }
 #else
     dom_code = split_out_cap(base_addr, tot_size, 1);
@@ -2151,11 +2180,23 @@ static unsigned map_grant(unsigned dom, unsigned region, unsigned len, unsigned 
         if (mapping_live[m] == 0) { break; }
     }
     if (m >= CAPSTONE_MAX_MAPPING_N) { return -1; }
-    if (managed_can_allocate() == 0) { return -1; }
-    rest = regions[region];
-    if (cap_type(rest) != 0) { regions[region] = rest; return -1; }
+    /* CREATE refuses (it faults the monitor) a context whose delivery slot is
+     * occupied: a delivery not yet taken, or the saved state of a preempted,
+     * faulted or never-entered domain. Refuse the grant here instead. A
+     * preempted domain has no free a2 either. */
+    if (mapping_delivery_pending[dom] != 0) { return -1; }
+    if (mapping_domain_at_round[dom] == 0) { return -1; }
     pages = len >> 12;
     leaves = (pages + 255) >> 8;
+    /* Every node this grant and the domain's first use of it consume, admitted
+     * before any state changes: one SPLIT for the root page and one per table
+     * page and frame, two for CREATE (senior and junior), one for the
+     * revocation handle the domain's libc derives from the mapping. Without it
+     * a large grant under node pressure faulted inside this function with
+     * cause 30 after it had already taken the region apart (M2 review). */
+    if (managed_can_allocate_n(pages + leaves + 4) == 0) { return -1; }
+    rest = regions[region];
+    if (cap_type(rest) != 0) { regions[region] = rest; return -1; }
     need = (1 + leaves + pages) << 12;
     base = cap_base(rest);
     if (cap_end(rest) - base < need) { regions[region] = rest; return -1; }
@@ -2203,6 +2244,7 @@ static unsigned map_grant(unsigned dom, unsigned region, unsigned len, unsigned 
     if (m < CAPSTONE_MAX_MAPPING_N) { mapping_hi[m] = hi; }
     if (m < CAPSTONE_MAX_MAPPING_N) { mapping_binding[m] = binding; }
     if (m < CAPSTONE_MAX_MAPPING_N) { mapping_live[m] = 1; }
+    if (dom < CAPSTONE_MAX_DOM_N) { mapping_delivery_pending[dom] = 1; }
     return binding;
 }
 
